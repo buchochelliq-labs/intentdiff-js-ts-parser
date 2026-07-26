@@ -1,0 +1,28 @@
+# Bundled parser metadata for the IntentDiff language-info API.
+# Plugin code exposes this data; the host still owns trust and provenance.
+
+[plugin]
+author = IntentDiff
+plugin_version = 0.1.0
+last_updated = 2026-05-19
+
+[language.javascript]
+language_name = Javascript
+language_short_name = Javascript
+monaco_language = javascript
+default_filename = code.js
+language_file_extensions = .js, .mjs, .cjs, .jsx
+
+[language.typescript]
+language_name = Typescript
+language_short_name = Typescript
+monaco_language = typescript
+default_filename = code.ts
+language_file_extensions = .ts, .mts, .cts
+
+[language.tsx]
+language_name = TSX
+language_short_name = TSX
+monaco_language = typescript
+default_filename = component.tsx
+language_file_extensions = .tsx
