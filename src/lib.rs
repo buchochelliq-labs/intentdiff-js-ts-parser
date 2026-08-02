@@ -13,7 +13,7 @@
 use intentdiff_plugin_sdk::{
     cst::CstNode,
     hash::structural_hash_with_memo,
-    tree::{SemanticNode, SemanticNodeBuilder},
+    tree::{NodeFacts, SemanticNode, SemanticNodeBuilder},
 };
 
 wit_bindgen::generate!({
@@ -73,6 +73,15 @@ const SEMANTIC_TYPES: &[&str] = &[
     "arrow_function",
     "generator_function_declaration",
     "generator_function",
+    // `async` variants (see `async_variant_of`). tree-sitter encodes `async` as an
+    // ANONYMOUS keyword token, so a distinct node type is the only way async-ness
+    // survives into the tree. Each variant is listed here exactly when its non-async
+    // counterpart above is, so async code keeps its counterpart's shape.
+    "async_function_declaration",
+    "async_function",
+    "async_arrow_function",
+    "async_generator_function_declaration",
+    "async_generator_function",
     "formal_parameters",
     "required_parameter",
     "optional_parameter",
@@ -81,6 +90,7 @@ const SEMANTIC_TYPES: &[&str] = &[
     "class",
     "abstract_class_declaration",
     "method_definition",
+    "async_method_definition",
     "field_definition",
     // Variables
     "variable_declaration",
@@ -283,7 +293,9 @@ fn label_for(node: &CstNode) -> String {
         }
         // Named declarations: first identifier child is the name
         "function_declaration"
+        | "async_function_declaration"
         | "generator_function_declaration"
+        | "async_generator_function_declaration"
         | "class_declaration"
         | "abstract_class_declaration"
         | "interface_declaration"
@@ -298,6 +310,7 @@ fn label_for(node: &CstNode) -> String {
         }
         // Methods and field definitions
         "method_definition"
+        | "async_method_definition"
         | "field_definition"
         | "method_signature"
         | "property_signature"
@@ -381,7 +394,9 @@ fn label_for(node: &CstNode) -> String {
                 if matches!(
                     child.node_type.as_str(),
                     "function_declaration"
+                        | "async_function_declaration"
                         | "generator_function_declaration"
+                        | "async_generator_function_declaration"
                         | "class_declaration"
                         | "abstract_class_declaration"
                         | "interface_declaration"
@@ -484,6 +499,21 @@ fn is_method_like(node_type: &str) -> bool {
             | "method_definition"
             | "method_signature"
             | "abstract_method_signature"
+    ) || is_async_node_type(node_type)
+}
+
+/// The node types minted by [`async_variant_of`]. Kept in one place so every vocabulary
+/// that asks "is this a function?" answers the same for `async f` as it does for `f`.
+fn is_async_node_type(node_type: &str) -> bool {
+    matches!(
+        node_type,
+        "async_function_declaration"
+            | "async_function"
+            | "async_function_expression"
+            | "async_arrow_function"
+            | "async_generator_function_declaration"
+            | "async_generator_function"
+            | "async_method_definition"
     )
 }
 
@@ -557,7 +587,47 @@ fn convert(
         }
     }
 
+    // Privacy-safe facts: async-ness is the one fact this parser can positively determine
+    // from the node type alone (a flag, never text/names/literals). The engine derives
+    // param_count/returns/body for every Wasm-parsed language from the pruned tree.
+    if is_async_node_type(&node.node_type) {
+        builder = builder.facts(NodeFacts {
+            is_async: Some(true),
+            ..NodeFacts::default()
+        });
+    }
+
     Some(builder.build())
+}
+
+/// The distinct node type for an `async` function/method, or `None` when the node is not a
+/// function form or carries no `async` keyword.
+///
+/// tree-sitter-javascript / -typescript encode `async` as an ANONYMOUS keyword token:
+/// `async function f() {}` is a plain `function_declaration` whose `async` child is unnamed.
+/// `node_to_cst` walks named children only, so the token was dropped and `function f()` vs
+/// `async function f()` serialised byte-identically — the toggle read as STYLE-ONLY even
+/// though every call site now receives a Promise (the #30 class). Mirror the python parser's
+/// `async_function_def` treatment and mint a distinct type so async-ness survives.
+///
+/// Unlike python's `async def`, the `async` token is not always first (`static async m()`),
+/// so scan the direct children instead of testing `child(0)`. `async` used as a plain name
+/// (`function async() {}`) parses as an `identifier`, never as an `async` keyword node, so
+/// this cannot false-positive.
+fn async_variant_of(node: tree_sitter::Node<'_>) -> Option<&'static str> {
+    let variant = match node.kind() {
+        "function_declaration" => "async_function_declaration",
+        "function" => "async_function",
+        "function_expression" => "async_function_expression",
+        "arrow_function" => "async_arrow_function",
+        "generator_function_declaration" => "async_generator_function_declaration",
+        "generator_function" => "async_generator_function",
+        "method_definition" => "async_method_definition",
+        _ => return None,
+    };
+    let mut cursor = node.walk();
+    let has_async = node.children(&mut cursor).any(|c| c.kind() == "async");
+    has_async.then_some(variant)
 }
 
 fn node_to_cst(node: tree_sitter::Node<'_>, source: &[u8]) -> CstNode {
@@ -579,7 +649,9 @@ fn node_to_cst(node: tree_sitter::Node<'_>, source: &[u8]) -> CstNode {
     };
 
     CstNode {
-        node_type: node.kind().to_string(),
+        node_type: async_variant_of(node)
+            .map(str::to_string)
+            .unwrap_or_else(|| node.kind().to_string()),
         named: node.is_named(),
         text,
         start_line: node.start_position().row as u32,
@@ -749,5 +821,74 @@ mod tests {
     fn process_impl_whitespace_returns_valid_json() {
         let out = process_impl("   \n  ", "javascript", "test.js");
         t::assert_valid_json(&out, "process(whitespace)");
+    }
+
+    // ---- issue #30: async-ness must survive into the tree, never style-only ----
+
+    /// The whole defect in one assertion: the two sides must not serialise identically.
+    fn assert_async_toggle_visible(plain: &str, asyncy: &str, language: &str, filename: &str) {
+        let old = process_impl(plain, language, filename);
+        let new = process_impl(asyncy, language, filename);
+        assert_ne!(
+            old, new,
+            "async toggle produced byte-identical trees for {filename}: {plain:?} vs {asyncy:?}"
+        );
+    }
+
+    #[test]
+    fn async_toggle_changes_the_tree() {
+        for (plain, asyncy) in [
+            ("function f() { return 1; }", "async function f() { return 1; }"),
+            ("const f = () => 1;", "const f = async () => 1;"),
+            ("const f = function () { return 1; };", "const f = async function () { return 1; };"),
+            ("class C { m() { return 1; } }", "class C { async m() { return 1; } }"),
+            ("class C { static m() { return 1; } }", "class C { static async m() { return 1; } }"),
+            ("function* g() { yield 1; }", "async function* g() { yield 1; }"),
+        ] {
+            assert_async_toggle_visible(plain, asyncy, "javascript", "test.js");
+            assert_async_toggle_visible(plain, asyncy, "typescript", "test.ts");
+        }
+    }
+
+    #[test]
+    fn async_function_declaration_is_emitted_with_is_async_fact() {
+        let out = process_impl("async function f() { return 1; }", "javascript", "test.js");
+        assert!(
+            out.contains("async_function_declaration"),
+            "expected an async_function_declaration node, got: {out}"
+        );
+        assert!(
+            out.contains("\"is_async\":true"),
+            "expected the is_async NodeFacts flag, got: {out}"
+        );
+    }
+
+    #[test]
+    fn async_method_definition_is_emitted() {
+        let out = process_impl("class C { async m() {} }", "javascript", "test.js");
+        assert!(
+            out.contains("async_method_definition"),
+            "expected an async_method_definition node, got: {out}"
+        );
+    }
+
+    /// `async` used as an ordinary name is an `identifier`, never the keyword token, so the
+    /// scan in `async_variant_of` must not mint an async variant for it.
+    #[test]
+    fn async_as_a_plain_name_is_not_an_async_function() {
+        let out = process_impl("function async() { return 1; }", "javascript", "test.js");
+        assert!(
+            !out.contains("async_function_declaration"),
+            "`function async()` is not an async function, got: {out}"
+        );
+    }
+
+    /// A plain function must keep its original node type and emit no facts.
+    #[test]
+    fn plain_function_is_untouched() {
+        let out = process_impl("function f() { return 1; }", "javascript", "test.js");
+        assert!(out.contains("function_declaration"), "got: {out}");
+        assert!(!out.contains("async_"), "plain function gained async vocabulary: {out}");
+        assert!(!out.contains("is_async"), "plain function gained an is_async fact: {out}");
     }
 }
